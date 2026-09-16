@@ -1,0 +1,12 @@
+.env
+config.yaml
+*.pem
+*.key
+id_*
+!*.pub.example
+logs/
+*.log
+__pycache__/
+*.py[cod]
+.venv/
+venv/
