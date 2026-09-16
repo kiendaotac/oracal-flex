@@ -1,0 +1,246 @@
+name: build-image
+
+# Builds a multi-arch image (amd64 + arm64) and pushes it to GitHub Container
+# Registry, so the Raspberry Pi only ever has to `docker pull`.
+
+on:
+  push:
+    branches: [main, master]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  REGISTRY: ghcr.io
+
+jobs:
+  # --------------------------------------------------------------------- #
+  # Fast feedback before we spend minutes building for two architectures.
+  # --------------------------------------------------------------------- #
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Byte-compile every module
+        run: python -m compileall -q a1launcher
+
+      - name: Offline smoke tests
+        run: python tests/smoke_test.py
+
+      - name: Build preflight fixtures
+        run: |
+          set -euo pipefail
+          mkdir -p fixtures
+          ssh-keygen -t ed25519 -N '' -f fixtures/test_key -q
+          openssl genrsa -out fixtures/api_key.pem 2048 2>/dev/null
+          cat > fixtures/oci_config <<EOF
+          [DEFAULT]
+          user=ocid1.user.oc1..aaaaaaaabcdefghijklmnopqrstuvwxyz1234567890
+          fingerprint=aa:bb:cc:dd:ee:ff:00:11:22:33:44:55:66:77:88:99
+          tenancy=ocid1.tenancy.oc1..aaaaaaaabcdefghijklmnopqrstuvwxyz1234567890
+          region=ap-singapore-1
+          key_file=$PWD/fixtures/api_key.pem
+          EOF
+          cat > fixtures/.env <<EOF
+          COMPARTMENT_ID=ocid1.tenancy.oc1..aaaaaaaabcdefghijklmnopqrstuvwxyz1234567890
+          SUBNET_ID=ocid1.subnet.oc1.ap-singapore-1.aaaaaaaabcdefghijklmnop1234567890
+          IMAGE_ID=ocid1.image.oc1.ap-singapore-1.aaaaaaaabcdefghijklmnop1234567890
+          SSH_PUBLIC_KEY_PATH=$PWD/fixtures/test_key.pub
+          DISPLAY_NAME=a1-ci
+          OCI_CONFIG_FILE=$PWD/fixtures/oci_config
+          LOG_FILE=$PWD/fixtures/a1.log
+          EOF
+
+      - name: Preflight accepts a good config
+        run: |
+          python -m a1launcher --check --no-api-check \
+            --env-file fixtures/.env --config /nonexistent.yaml
+
+      - name: Preflight rejects a bad config
+        env:
+          SUBNET_ID: ocid1.vcn.oc1.x.aaaawrongprefix
+          OCPUS: "1"
+          MEMORY_GB: "20"
+        run: |
+          set +e
+          python -m a1launcher --check --no-api-check \
+            --env-file fixtures/.env --config /nonexistent.yaml
+          code=$?
+          set -e
+          if [ "$code" -eq 0 ]; then
+            echo "::error::preflight passed a config it should have rejected"
+            exit 1
+          fi
+          echo "preflight correctly rejected the bad config (exit $code)"
+
+  # --------------------------------------------------------------------- #
+  # Multi-arch build. arm64 is produced under QEMU emulation: every
+  # dependency ships a prebuilt aarch64 wheel, so nothing is compiled and
+  # the emulated leg stays in the single-digit minutes.
+  # --------------------------------------------------------------------- #
+  build:
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      image: ${{ steps.image_name.outputs.image }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Compute lowercase image name
+        id: image_name
+        run: echo "image=${REGISTRY}/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-qemu-action@v3
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to ${{ env.REGISTRY }}
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Derive tags and labels
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ steps.image_name.outputs.image }}
+          tags: |
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=ref,event=branch
+            type=ref,event=pr
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=sha,format=short
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          # Keep the manifest plain: the Docker shipped with Raspberry Pi OS
+          # can choke on provenance/SBOM attestation entries.
+          provenance: false
+          sbom: false
+
+  # --------------------------------------------------------------------- #
+  # Prove the pushed image actually runs before anyone pulls it.
+  # --------------------------------------------------------------------- #
+  smoke-test:
+    needs: build
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - name: Log in to ${{ env.REGISTRY }}
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Resolve the tag built for this commit
+        id: tag
+        run: echo "ref=${{ needs.build.outputs.image }}:sha-${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+
+      - name: Image reports its version
+        run: docker run --rm "${{ steps.tag.outputs.ref }}" --version
+
+      - name: Image refuses to run without configuration
+        run: |
+          set +e
+          docker run --rm "${{ steps.tag.outputs.ref }}" --check --no-api-check
+          code=$?
+          set -e
+          if [ "$code" -eq 0 ]; then
+            echo "::error::image passed preflight with no configuration at all"
+            exit 1
+          fi
+          echo "image correctly refused to run without configuration (exit $code)"
+
+      - name: Manifest contains both architectures
+        run: |
+          docker buildx imagetools inspect "${{ steps.tag.outputs.ref }}" | tee manifest.txt
+          grep -q "linux/amd64" manifest.txt
+          grep -q "linux/arm64" manifest.txt
+          echo "manifest contains both amd64 and arm64"
+
+      # The Pi should be able to `docker pull` with no credentials at all.
+      # GHCR packages start out private and only a human can flip that, so this
+      # warns instead of failing: on the very first push the package cannot
+      # already be public, because it did not exist until a moment ago.
+      # Every request here is deliberately unauthenticated — that is the point.
+      - name: Check the package is pullable without logging in
+        run: |
+          set -uo pipefail
+          repo="${{ needs.build.outputs.image }}"
+          path="${repo#"${REGISTRY}"/}"
+          tag="sha-${GITHUB_SHA::7}"
+
+          # A private package makes the anonymous token endpoint itself fail,
+          # so neither call may abort the step.
+          token=$(curl -sSL "https://ghcr.io/token?scope=repository:${path}:pull&service=ghcr.io" \
+            | jq -r '.token // empty' 2>/dev/null || true)
+
+          if [ -z "$token" ]; then
+            http_status="no-anonymous-token"
+          else
+            http_status=$(curl -s -o /dev/null -w '%{http_code}' \
+              -H "Authorization: Bearer ${token}" \
+              -H "Accept: application/vnd.oci.image.index.v1+json" \
+              -H "Accept: application/vnd.docker.distribution.manifest.list.v2+json" \
+              "https://ghcr.io/v2/${path}/manifests/${tag}" || echo "request-failed")
+          fi
+
+          if [ "$http_status" = "200" ]; then
+            echo "PUBLIC: anyone can pull ${repo} without logging in."
+            {
+              echo "### ✅ Image is public"
+              echo ''
+              # shellcheck disable=SC2016 # markdown backticks, kept literal
+            echo 'On the Raspberry Pi, no `docker login` needed:'
+              echo ''
+              echo '```bash'
+              echo "docker pull ${repo}:latest"
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "::warning::Package is still PRIVATE (anonymous check: ${http_status}). The Pi will need 'docker login ghcr.io' until you make it public — see the job summary."
+            {
+              echo "### ⚠️ Image is still private"
+              echo ''
+              echo "Anonymous pull check returned \`${http_status}\`, so \`docker pull\` on the Pi"
+              # shellcheck disable=SC2016 # markdown backticks, kept literal
+            echo 'would fail with `denied`. Fix it once and it sticks for every future push:'
+              echo ''
+              echo "1. Open <https://github.com/${GITHUB_REPOSITORY}/pkgs/container/${GITHUB_REPOSITORY##*/}>"
+              echo '2. Click **Package settings** on the right'
+              echo '3. Scroll to **Danger Zone** → **Change visibility** → **Public**'
+              echo '4. Re-run this workflow to confirm'
+              echo ''
+              # shellcheck disable=SC2016 # markdown backticks, kept literal
+            echo 'This cannot be automated here: `GITHUB_TOKEN` is not allowed to change'
+              echo 'package visibility.'
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
