@@ -209,8 +209,25 @@ docker run --rm --name a1launcher \
 ```
 
 Container là **one-shot**: chạy retry tới khi tạo được instance thì exit `0`,
-`--rm` sẽ tự xoá container. Muốn chạy nền lâu dài thì thêm `-d` và
-`--restart unless-stopped`, theo dõi bằng `docker logs -f a1launcher`.
+`--rm` sẽ tự xoá container.
+
+Muốn chạy nền lâu dài (bỏ `--rm`, vì `--rm` xung đột với `--restart`):
+
+```bash
+docker run -d --name a1launcher --restart on-failure:3 \
+  -v ~/.oci:/home/app/.oci:ro \
+  -v "$PWD/.env:/app/.env:ro" \
+  -v ~/.ssh/id_ed25519.pub:/keys/id_ed25519.pub:ro \
+  -v "$PWD/logs:/var/log/a1launcher" \
+  a1launcher:latest
+
+docker logs -f a1launcher
+```
+
+> ⚠️ **Đừng dùng `--restart unless-stopped` hay `--restart always`.** Hai policy này
+> chạy lại container **kể cả khi nó exit `0`** — tức là ngay sau khi tạo instance thành
+> công, nó sẽ khởi động lại và **tạo tiếp instance thứ hai**, ăn nốt phần quota A1 còn lại.
+> `on-failure` chỉ chạy lại khi exit code khác 0, nên launch xong là dừng hẳn.
 
 ### Những điểm cần nhớ khi mount
 
