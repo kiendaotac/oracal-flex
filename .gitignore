@@ -3,6 +3,7 @@ config.yaml
 *.pem
 *.key
 id_*
+oci_config
 !*.pub.example
 logs/
 *.log

@@ -30,59 +30,146 @@ tests/smoke_test.py   # test offline, không cần tài khoản OCI
 
 ---
 
-## 2. Chuẩn bị
+## 2. Bố cục thư mục trên Pi — mọi thứ nằm ở MỘT chỗ
 
-Cần có sẵn trên máy (host):
+Không dùng `~/.oci`, `~/.ssh` hay bất kỳ thư mục hệ thống nào. Tất cả config và key nằm
+chung trong thư mục project, và cả thư mục được mount vào container ở **`/data`**:
 
-1. **`~/.oci/config`** + private API key (`.pem`) — tạo ở OCI Console:
-   *Profile → User settings → API keys → Add API key*.
-2. **SSH public key** (`~/.ssh/id_ed25519.pub`) để SSH vào instance sau khi tạo.
-3. Ba OCID:
-   - `COMPARTMENT_ID` — OCID tenancy hoặc compartment.
-   - `SUBNET_ID` — subnet của VCN (nên là public subnet nếu muốn có public IP).
-   - `IMAGE_ID` — **bắt buộc là image aarch64** (bản ARM của Ubuntu / Oracle Linux).
-     Lấy nhanh bằng OCI CLI:
-     ```bash
-     oci compute image list --compartment-id <OCID> --shape VM.Standard.A1.Flex --output table
-     ```
+```
+~/oracal-flex/                 (trên Pi)        →  /data/ (trong container, read-only)
+├── .env                       cấu hình         →  /data/.env
+├── oci_config                 config OCI       →  /data/oci_config
+├── oci_api_key.pem            private API key  →  /data/oci_api_key.pem
+├── id_ed25519.pub             SSH public key   →  /data/id_ed25519.pub
+└── logs/                      log (ghi được)   →  /var/log/a1launcher/
+```
+
+⚠️ **Mọi đường dẫn trong `.env` và `oci_config` là đường dẫn BÊN TRONG container**
+(`/data/...`), không phải đường dẫn trên Pi.
+
+Cả bốn file đều đã có trong `.gitignore` / `.dockerignore`, nhưng vẫn **đừng `git add .`**
+trong thư mục này.
 
 ---
 
-## 3. Cấu hình
+## 3. Chuẩn bị từng file
 
-Copy file mẫu rồi sửa:
+Làm lần lượt trên Pi, trong thư mục project:
 
 ```bash
-cp .env.example .env          # hoặc: cp config.yaml.example config.yaml
+cd ~/oracal-flex
 ```
 
-Thứ tự ưu tiên (cao xuống thấp): **biến môi trường thật → `.env` → `config.yaml` → mặc định**.
-Dùng file nào cũng được, hoặc kết hợp cả hai.
+### 3.1. `oci_api_key.pem` + `oci_config` — lấy từ Oracle Console
 
-| Biến | Mặc định | Ghi chú |
-|---|---|---|
-| `COMPARTMENT_ID` / `SUBNET_ID` / `IMAGE_ID` | — | bắt buộc |
-| `SSH_PUBLIC_KEY_PATH` | `/keys/id_ed25519.pub` | **đường dẫn bên trong container** |
-| `OCI_CONFIG_FILE` | `~/.oci/config` | **đường dẫn bên trong container** |
-| `OCI_PROFILE` | `DEFAULT` | profile trong file config |
-| `OCPUS` / `MEMORY_GB` | `2` / `12` | nằm trong hạn mức free |
-| `BOOT_VOLUME_GB` | `50` | tối thiểu 50 |
-| `MIN_DELAY_SECONDS` / `MAX_DELAY_SECONDS` | `60` / `180` | nghỉ ngẫu nhiên giữa 2 vòng |
-| `AD_DELAY_SECONDS` | `10` | nghỉ giữa 2 AD trong cùng một vòng |
-| `RATE_LIMIT_SLEEP_SECONDS` | `900` | nghỉ thêm khi dính HTTP 429 |
-| `MAX_ROUNDS` | `0` | `0` = lặp vô hạn |
-| `AVAILABILITY_DOMAINS` | rỗng | rỗng = tự lấy và thử hết mọi AD |
-| `LOG_FILE` | `/var/log/a1launcher/a1launcher.log` | log xoay vòng 5 MB × 3 |
-| `TELEGRAM_ENABLED` | `false` | xem mục 8 |
+1. <https://cloud.oracle.com> → **avatar góc phải trên** → **My profile** →
+   **Tokens and keys** → **API keys** → **Add API key**.
+2. **Generate API key pair** → **Download private key** → bấm **Add**.
+3. Oracle hiện khung **Configuration file preview** (bắt đầu bằng `[DEFAULT]`) → copy lại.
+   Lỡ đóng thì bấm **⋮** ở dòng key → **View configuration file**.
+
+Đưa file `.pem` lên Pi (chạy trên máy đã tải file về):
+
+```bash
+scp ~/Downloads/<ten-file>.pem <user>@<pi>:~/oracal-flex/oci_api_key.pem
+```
+
+Trên Pi, tạo `oci_config`, dán đoạn vừa copy, **sửa dòng `key_file`**:
+
+```bash
+nano oci_config
+```
+
+```ini
+[DEFAULT]
+user=ocid1.user.oc1..aaaa...
+fingerprint=12:34:56:...
+tenancy=ocid1.tenancy.oc1..aaaa...
+region=ap-singapore-2
+key_file=/data/oci_api_key.pem
+```
+
+```bash
+chmod 600 oci_api_key.pem
+```
+
+### 3.2. `id_ed25519.pub` — SSH public key
+
+Key này dùng để SSH vào instance sau khi tạo. Dùng key của **máy mà bạn sẽ SSH từ đó**
+(ví dụ Mac) — chỉ copy file `.pub`, private key ở yên trên máy đó:
+
+```bash
+scp ~/.ssh/id_ed25519.pub <user>@<pi>:~/oracal-flex/id_ed25519.pub
+```
+
+Chưa có key thì tạo trước bằng `ssh-keygen -t ed25519` (Enter hết).
+
+### 3.3. `.env`
+
+```bash
+cp .env.example .env && nano .env
+```
+
+Hoặc chỉ ghi những dòng cần — mọi biến khác lấy mặc định. `.env` tối thiểu:
+
+```ini
+OCI_CONFIG_FILE=/data/oci_config
+SSH_PUBLIC_KEY_PATH=/data/id_ed25519.pub
+COMPARTMENT_ID=ocid1.tenancy.oc1..aaaa...
+SUBNET_ID=ocid1.subnet.oc1.ap-singapore-2.aaaa...
+IMAGE_ID=ocid1.image.oc1.ap-singapore-2.aaaa...
+```
+
+Lấy ba OCID:
+
+| Biến | Lấy ở đâu |
+|---|---|
+| `COMPARTMENT_ID` | dùng luôn giá trị `tenancy=` trong `oci_config`: `echo "COMPARTMENT_ID=$(grep '^tenancy' oci_config \| cut -d= -f2 \| tr -d ' ')" >> .env` |
+| `SUBNET_ID` | Console → **Networking** → **Virtual cloud networks** → VCN → **Subnets** → public subnet → **Copy** OCID. Chưa có VCN: **Start VCN Wizard** → *Create VCN with Internet Connectivity* |
+| `IMAGE_ID` | chạy lệnh ở dưới — hỏi thẳng Oracle, đồng thời kiểm tra luôn `oci_config` + `.pem` có chạy không |
+
+Liệt kê image Ubuntu **aarch64** hợp với A1 trong region của bạn:
+
+```bash
+docker run --rm -v "$PWD:/data:ro" --entrypoint python ghcr.io/kiendaotac/oracal-flex:latest -c '
+import oci
+cfg = oci.config.from_file("/data/oci_config")
+c = oci.core.ComputeClient(cfg)
+imgs = oci.pagination.list_call_get_all_results(
+    c.list_images, cfg["tenancy"],
+    operating_system="Canonical Ubuntu",
+    shape="VM.Standard.A1.Flex",
+    sort_by="TIMECREATED", sort_order="DESC").data
+for i in imgs[:5]:
+    print(i.display_name, "\n  ", i.id)
+'
+```
+
+Chọn bản `Canonical-Ubuntu-24.04-aarch64-...` (không phải Minimal) và copy OCID bên dưới.
+
+⚠️ `SUBNET_ID` và `IMAGE_ID` phải **cùng region** với `oci_config`, và region đó phải là
+**home region** (Console → avatar → **Tenancy** → *Home region*) thì mới được tính free.
+
+### 3.4. Thư mục log
+
+```bash
+mkdir -p logs
+```
 
 ---
 
 ## 4. Lấy image
 
-### 4.1. Cách khuyên dùng: pull từ GHCR (CI build sẵn)
+### 4.1. Pull từ GHCR (CI build sẵn)
 
-Push code lên GitHub là xong — workflow `.github/workflows/build-image.yml` tự chạy
-3 job nối tiếp:
+```bash
+docker pull ghcr.io/kiendaotac/oracal-flex:latest
+```
+
+Package đang **public** — không cần `docker login`. Docker tự chọn layer arm64.
+
+Workflow `.github/workflows/build-image.yml` chỉ chạy khi push lên **`master`/`main`** hoặc
+push tag `v*`. Push lên `develop` **không** tạo image mới.
 
 | Job | Làm gì |
 |---|---|
@@ -90,79 +177,28 @@ Push code lên GitHub là xong — workflow `.github/workflows/build-image.yml` 
 | `build` | build multi-arch `linux/amd64` + `linux/arm64`, push lên GHCR |
 | `smoke-test` | pull lại image vừa push, chạy thử, kiểm tra manifest có đủ 2 kiến trúc |
 
-Tag được tạo tự động:
-
 | Tag | Khi nào |
 |---|---|
-| `latest` | push lên nhánh mặc định |
+| `latest` | push lên nhánh mặc định (`master`) |
 | `v1.2.3`, `v1.2` | push git tag `v*` |
 | `sha-abc1234` | mọi commit |
 
-Trên Raspberry Pi chỉ cần:
+> **Package mới tạo trên GHCR mặc định là PRIVATE.** Mở public (làm một lần): trang repo →
+> **Packages** → chọn package → **Package settings** → **Danger Zone** → **Change visibility**
+> → **Public**. `GITHUB_TOKEN` không có quyền đổi visibility nên CI không làm hộ được; job
+> `smoke-test` chỉ cảnh báo nếu package vẫn private.
+
+> Job `build` báo `403 denied` lúc push: *Settings → Actions → General → Workflow
+> permissions* → **Read and write permissions**.
+
+### 4.2. Hoặc build tại chỗ
 
 ```bash
-docker pull ghcr.io/<github-user>/<repo>:latest
+docker build -t a1launcher:latest .                                    # build trên Pi
+docker buildx build --platform linux/arm64 -t a1launcher:latest --load .  # build trên Mac/PC
 ```
 
-Docker tự chọn layer arm64 — không cần làm gì thêm.
-
-### 4.2. Mở public package (làm 1 lần, để Pi khỏi phải `docker login`)
-
-⚠️ **Package trên GHCR mặc định là PRIVATE**, kể cả khi repo là public. Chưa mở thì
-`docker pull` trên Pi sẽ báo `denied`.
-
-Mở public — **chỉ làm đúng một lần**, từ đó mọi lần push sau đều public:
-
-1. Push code lên GitHub, đợi workflow chạy xong lần đầu (package phải tồn tại rồi
-   mới mở được).
-2. Mở `https://github.com/<github-user>/<repo>/pkgs/container/<repo>`
-   (hoặc: trang repo → mục **Packages** bên phải → chọn package).
-3. Bấm **Package settings** ở cột phải.
-4. Kéo xuống **Danger Zone** → **Change visibility** → chọn **Public** → xác nhận
-   bằng cách gõ tên package.
-
-Xong. Trên Pi pull thẳng, không cần đăng nhập, không cần token gì hết.
-
-> **Tại sao CI không tự làm hộ?** `GITHUB_TOKEN` không có quyền đổi visibility của
-> package — muốn tự động thì phải nhét thêm một PAT quyền admin vào secrets, phiền
-> và rủi ro hơn hẳn so với một lần bấm chuột.
->
-> Bù lại, job `smoke-test` có bước **"Check the package is pullable without logging in"**:
-> nó thử gọi GHCR **không kèm credential**. Nếu vẫn private thì workflow không fail,
-> chỉ in cảnh báo vàng kèm đúng đường dẫn cần bấm trong phần *Summary* của lần chạy đó.
-> Sau khi mở public, chạy lại workflow sẽ thấy `✅ Image is public`.
-
-> Nếu vẫn muốn giữ private: trên Pi đăng nhập bằng PAT classic scope `read:packages`:
-> ```bash
-> echo <PERSONAL_ACCESS_TOKEN> | docker login ghcr.io -u <github-user> --password-stdin
-> ```
-
-> Nếu job `build` báo lỗi `403 denied` lúc push: vào *Settings → Actions → General →
-> Workflow permissions* và chọn **Read and write permissions**.
-
-Cập nhật về sau:
-
-```bash
-docker pull ghcr.io/<github-user>/<repo>:latest     # kéo bản mới
-# hoặc thêm --pull always vào lệnh docker run
-```
-
-### 4.3. Hoặc build tại chỗ
-
-Build ngay trên con Pi:
-
-```bash
-docker build -t a1launcher:latest .
-```
-
-Build trên máy khác (Mac/PC) rồi mới đẩy sang Pi:
-
-```bash
-docker buildx build --platform linux/arm64 -t a1launcher:latest --load .
-```
-
-Phần dưới dùng tên `a1launcher:latest`; nếu pull từ GHCR thì thay bằng
-`ghcr.io/<github-user>/<repo>:latest`.
+Khi đó thay `ghcr.io/kiendaotac/oracal-flex:latest` bằng `a1launcher:latest` trong các lệnh dưới.
 
 ---
 
@@ -171,12 +207,10 @@ Phần dưới dùng tên `a1launcher:latest`; nếu pull từ GHCR thì thay b�
 `--check` chỉ kiểm tra cấu hình rồi thoát, **không launch gì cả**:
 
 ```bash
-docker run --rm \
-  -v ~/.oci:/home/app/.oci:ro \
-  -v "$PWD/.env:/app/.env:ro" \
-  -v ~/.ssh/id_ed25519.pub:/keys/id_ed25519.pub:ro \
-  a1launcher:latest --check
+docker run --rm -v "$PWD:/data:ro" ghcr.io/kiendaotac/oracal-flex:latest --env-file /data/.env --check
 ```
+
+Kết quả mong đợi ở dòng cuối: `N passed, 0 warning(s), 0 failed` → `All checks passed`.
 
 Nó kiểm tra và in PASS/FAIL từng mục:
 
@@ -184,89 +218,213 @@ Nó kiểm tra và in PASS/FAIL từng mục:
 - định dạng OCID (`ocid1.tenancy`/`ocid1.compartment`, `ocid1.subnet`, `ocid1.image`);
 - `ocpus`/`memory_gb` trong hạn mức Always Free (≤ 4 OCPU, ≤ 24 GB, ≤ 6 GB mỗi OCPU)
   và còn dư bao nhiêu cho instance A1 thứ hai;
-- `~/.oci/config` tồn tại, đọc được, profile hợp lệ, `key_file` trỏ tới file có thật;
+- `oci_config` tồn tại, đọc được, profile hợp lệ, `key_file` trỏ tới file có thật;
 - SSH public key: tồn tại, đúng 1 dòng, bắt đầu bằng `ssh-ed25519`/`ssh-rsa`/`ecdsa-`,
   **FAIL nếu lỡ trỏ vào private key**, và **in nội dung key ra để mắt kiểm tra**;
 - gọi thật 1 API read-only (`ListAvailabilityDomains`) và in danh sách AD tìm được.
 
-Có bất kỳ `FAIL` nào → exit code `1`. Chỉ khi tất cả PASS mới nên chạy launch thật.
+Có bất kỳ `FAIL` nào → exit code `1`.
 
 > Khi chạy launch thật, preflight vẫn tự chạy lại trước và **từ chối launch nếu có FAIL**.
-> Bỏ qua bằng `--skip-preflight` (không khuyến khích).
-> Muốn kiểm tra offline, không gọi API: thêm `--no-api-check`.
+> Bỏ qua bằng `--skip-preflight` (không khuyến khích). Kiểm tra offline: `--no-api-check`.
 
 ---
 
 ## 6. Chạy thật trên Raspberry Pi
 
 ```bash
-docker run --rm --name a1launcher \
-  -v ~/.oci:/home/app/.oci:ro \
-  -v "$PWD/.env:/app/.env:ro" \
-  -v ~/.ssh/id_ed25519.pub:/keys/id_ed25519.pub:ro \
+docker run -d --name a1launcher --restart on-failure \
+  -v "$PWD:/data:ro" \
   -v "$PWD/logs:/var/log/a1launcher" \
-  a1launcher:latest
+  ghcr.io/kiendaotac/oracal-flex:latest --env-file /data/.env
 ```
 
-Container là **one-shot**: chạy retry tới khi tạo được instance thì exit `0`,
-`--rm` sẽ tự xoá container.
+| Mount | Ý nghĩa |
+|---|---|
+| `-v "$PWD:/data:ro"` | cả thư mục project → `/data`, **read-only** |
+| `-v "$PWD/logs:/var/log/a1launcher"` | log ghi ra `./logs` trên Pi, còn lại sau khi xoá container |
+| `--env-file /data/.env` | flag của app (không phải của Docker) — chỉ chỗ đọc `.env` |
 
-Muốn chạy nền lâu dài (bỏ `--rm`, vì `--rm` xung đột với `--restart`):
+### Restart policy — vì sao là `on-failure`
+
+- **Pi mất điện / reboot**: container bị ngắt đột ngột được tính là lỗi → Docker tự chạy lại
+  khi Pi khởi động (cần `sudo systemctl enable docker` — kiểm tra bằng
+  `systemctl is-enabled docker`).
+- **Tạo instance thành công**: app exit `0` → Docker **không** chạy lại → không sinh
+  instance thứ hai.
+
+> ⚠️ **Không dùng `--restart unless-stopped` / `always`**: hai policy này chạy lại container
+> **kể cả khi exit `0`**, tức là ngay sau khi tạo được instance nó sẽ khởi động lại và
+> **tạo tiếp instance thứ hai** (2 OCPU/12 GB vẫn vừa quota). Nếu lỡ dùng thì phải
+> `docker rm -f a1launcher` ngay khi nhận thông báo.
+
+### Lệnh hằng ngày
 
 ```bash
-docker run -d --name a1launcher --restart on-failure:3 \
-  -v ~/.oci:/home/app/.oci:ro \
-  -v "$PWD/.env:/app/.env:ro" \
-  -v ~/.ssh/id_ed25519.pub:/keys/id_ed25519.pub:ro \
-  -v "$PWD/logs:/var/log/a1launcher" \
-  a1launcher:latest
-
-docker logs -f a1launcher
+docker logs -f a1launcher              # xem log trực tiếp (Ctrl+C để thoát, app vẫn chạy)
+docker logs --tail 20 a1launcher       # 20 dòng cuối
+docker ps                              # chỉ được có MỘT container a1launcher
+docker rm -f a1launcher                # dừng + xoá container
 ```
 
-> ⚠️ **Đừng dùng `--restart unless-stopped` hay `--restart always`.** Hai policy này
-> chạy lại container **kể cả khi nó exit `0`** — tức là ngay sau khi tạo instance thành
-> công, nó sẽ khởi động lại và **tạo tiếp instance thứ hai**, ăn nốt phần quota A1 còn lại.
-> `on-failure` chỉ chạy lại khi exit code khác 0, nên launch xong là dừng hẳn.
+Sửa `.env` xong phải **tạo lại container** thì mới nhận cấu hình mới:
 
-### Những điểm cần nhớ khi mount
+```bash
+docker rm -f a1launcher && docker run -d --name a1launcher --restart on-failure \
+  -v "$PWD:/data:ro" -v "$PWD/logs:/var/log/a1launcher" \
+  ghcr.io/kiendaotac/oracal-flex:latest --env-file /data/.env
+```
 
-- **Image không chứa credential.** `.env`, `~/.oci`, `.pem`, SSH key đều chỉ được mount
-  lúc chạy và `.dockerignore` chặn chúng khỏi build context — xoá image là không còn key.
-- ⚠️ **`key_file` trong `~/.oci/config` phải là đường dẫn BÊN TRONG container, không phải
-  đường dẫn trên host.** Đây là lỗi hay gặp nhất. Nếu mount `~/.oci` vào
-  `/home/app/.oci` thì trong file config phải ghi:
+Cập nhật image mới: `docker pull ghcr.io/kiendaotac/oracal-flex:latest` rồi tạo lại container
+như trên.
 
-  ```ini
-  [DEFAULT]
-  key_file=/home/app/.oci/oci_api_key.pem
-  ```
+### Log bình thường trông như thế nào
 
-  chứ không phải `/home/pi/.oci/oci_api_key.pem`. `--check` sẽ báo FAIL rõ ràng nếu sai.
+```
+Attempt #4: launching VM.Standard.A1.Flex in rjjd:AP-SINGAPORE-2-AD-1
+Out of host capacity in rjjd:AP-SINGAPORE-2-AD-1 (3 so far) — trying the next AD
+Round 4 found no capacity; sleeping 283s
+```
+
+`Out of host capacity` là **bình thường** — Oracle hết máy A1 free, app tự thử lại mãi.
+Có thể mất vài giờ tới vài tuần. Khi thành công sẽ có dòng `SUCCESS — instance ... created`
+kèm public IP (và tin Telegram nếu bật). SSH vào từ máy có private key:
+
+```bash
+ssh ubuntu@<IP>
+```
+
+### Những điểm cần nhớ
+
+- **Image không chứa credential.** Mọi key chỉ được mount lúc chạy; `.dockerignore` chặn
+  chúng khỏi build context — xoá image là không còn key.
 - Container chạy bằng user `app` **uid/gid 1000** — trùng user mặc định của Raspberry Pi OS,
-  nên file mount từ host đọc được mà không phải nới quyền. Nếu user trên Pi của bạn không
-  phải uid 1000, thêm `--user "$(id -u):$(id -g)"` vào lệnh `docker run`.
-- Mount `logs/` ra ngoài nếu muốn giữ log sau khi container biến mất.
-
-### Dọn sạch sau khi xong
-
-```bash
-docker rmi ghcr.io/<github-user>/<repo>:latest   # hoặc a1launcher:latest
-docker image prune -f                            # dọn layer thừa
-docker builder prune -f                          # dọn cache build (nếu có build tại chỗ)
-```
-
-Credential không bao giờ nằm trong image, nên xoá image là sạch.
+  nên `chmod 600 oci_api_key.pem` vẫn đọc được. Nếu user trên Pi không phải uid 1000, thêm
+  `--user "$(id -u):$(id -g)"`.
 
 ---
 
-## 7. Chạy trực tiếp (không Docker)
+## 7. Tuỳ chỉnh thời gian retry
+
+Oracle giới hạn rất chặt số lần gọi `LaunchInstance` với tài khoản free: thực tế cứ khoảng
+**4 lần trong 5 phút** là dính `429 TooManyRequests`. Thử dày hơn **không** tăng cơ hội,
+chỉ bị phạt nghỉ lâu hơn. Cấu hình đang dùng (đã là mặc định trong `.env.example`):
+
+```ini
+MIN_DELAY_SECONDS=240          # nghỉ ngẫu nhiên tối thiểu giữa 2 vòng
+MAX_DELAY_SECONDS=360          # ... tối đa  → ~1 lần mỗi 4–6 phút, ~290 lần/ngày
+RATE_LIMIT_SLEEP_SECONDS=600   # dính 429 thì nghỉ thêm 10 phút
+```
+
+| Biến | Mặc định code | Ghi chú |
+|---|---|---|
+| `MIN_DELAY_SECONDS` / `MAX_DELAY_SECONDS` | `60` / `180` | nghỉ ngẫu nhiên giữa 2 vòng. `60–180` quá dày cho tài khoản free |
+| `AD_DELAY_SECONDS` | `10` | nghỉ giữa 2 AD trong cùng vòng (region 1 AD thì không dùng tới) |
+| `RATE_LIMIT_SLEEP_SECONDS` | `900` | nghỉ thêm khi dính HTTP 429 |
+| `MAX_ROUNDS` | `0` | `0` = lặp vô hạn |
+
+Log vẫn thấy `429` đều đặn → tăng `MIN_DELAY_SECONDS`/`MAX_DELAY_SECONDS` thêm 60–120s.
+
+### Cấu hình máy
+
+| Biến | Mặc định | Ghi chú |
+|---|---|---|
+| `OCPUS` / `MEMORY_GB` | `2` / `12` | tổng mọi máy A1 ≤ 4 OCPU / 24 GB, ≤ 6 GB mỗi OCPU |
+| `BOOT_VOLUME_GB` | `50` | tối thiểu 50, tổng block storage free 200 GB |
+| `DISPLAY_NAME` | `a1-flex` | tên instance |
+| `AVAILABILITY_DOMAINS` | rỗng | rỗng = tự lấy và thử hết mọi AD |
+
+Máy nhỏ dễ có chỗ hơn: 2/12 dễ hơn 4/24, 1/6 còn dễ hơn nữa. Tạo xong vẫn **tăng được**
+(Console → Instance → **Edit** → **Edit shape**; máy sẽ reboot, và có thể báo hết capacity).
+
+### Toàn bộ biến
+
+| Biến | Mặc định | Ghi chú |
+|---|---|---|
+| `COMPARTMENT_ID` / `SUBNET_ID` / `IMAGE_ID` | — | bắt buộc |
+| `SSH_PUBLIC_KEY_PATH` | `/keys/id_ed25519.pub` | đặt `/data/id_ed25519.pub` |
+| `OCI_CONFIG_FILE` | `~/.oci/config` | đặt `/data/oci_config` |
+| `OCI_PROFILE` | `DEFAULT` | profile trong `oci_config` |
+| `SHAPE` | `VM.Standard.A1.Flex` | |
+| `ASSIGN_PUBLIC_IP` | `true` | |
+| `FAULT_DOMAIN` / `NSG_IDS` | rỗng | tuỳ chọn |
+| `LOG_FILE` | `/var/log/a1launcher/a1launcher.log` | log xoay vòng 5 MB × 3 |
+| `LOG_LEVEL` | `INFO` | |
+| `TELEGRAM_*` | tắt | xem mục 8 |
+
+Thứ tự ưu tiên (cao xuống thấp): **biến môi trường thật → `.env` → `config.yaml` → mặc định**.
+
+---
+
+## 8. Thông báo Telegram
+
+Khi tạo thành công, app gửi tin nhắn kèm OCID, public IP, số lần thử và tổng thời gian.
+Gửi lỗi chỉ ghi log, không ảnh hưởng kết quả launch.
+
+1. **Bot**: dùng bot có sẵn (**@BotFather** → `/mybots` → chọn bot → **API Token**, đừng bấm
+   *Revoke*) hoặc tạo mới (`/newbot`). Token dạng `123456789:AAH-xxxx`.
+2. **Mở chat với bot** và gửi một tin bất kỳ — bot không thể nhắn trước cho bạn.
+3. **Chat ID**: nhắn `/start` cho **@userinfobot**, lấy số ở dòng `Id:`. Đây là ID **tài khoản
+   của bạn** — **không phải** dãy số đầu token (đó là ID của bot).
+4. Thêm vào `.env`:
+
+   ```ini
+   TELEGRAM_ENABLED=true
+   TELEGRAM_BOT_TOKEN=123456789:AAH-xxxx
+   TELEGRAM_CHAT_ID=987654321
+   ```
+
+5. Gửi thử — lệnh tự đọc token từ `.env`, không phải gõ token ra terminal:
+
+   ```bash
+   (set -a; . ./.env; curl -s "https://api.telegram.org/bot$TELEGRAM_BOT_TOKEN/sendMessage" -d chat_id="$TELEGRAM_CHAT_ID" -d text="Test a1launcher OK")
+   ```
+
+   Phải thấy `{"ok":true,...` và nhận được tin. Xong thì **tạo lại container** (mục 6).
+
+| Lỗi | Nguyên nhân |
+|---|---|
+| `403 ... bot can't send messages to the bot` | `TELEGRAM_CHAT_ID` đang là ID của bot → lấy lại ở @userinfobot |
+| `400 ... chat not found` | chưa nhắn tin gì cho bot → mở bot, bấm **Start** |
+| `401 Unauthorized` | token sai hoặc đã bị revoke |
+
+---
+
+## 9. Các flag
+
+| Flag | Ý nghĩa |
+|---|---|
+| `--env-file /data/.env` | đường dẫn `.env` (bắt buộc với bố cục `/data`) |
+| `--check` | chỉ preflight rồi thoát |
+| `--dry-run` | in payload `LaunchInstanceDetails`, không gọi `LaunchInstance` |
+| `--no-api-check` | preflight không gọi API |
+| `--skip-preflight` | launch thẳng, bỏ preflight |
+| `--config` | đường dẫn `config.yaml` |
+| `--profile` | ghi đè `OCI_PROFILE` |
+| `--log-file` / `--log-level` | ghi đè cấu hình log |
+
+---
+
+## 10. Xử lý sự cố
+
+| Triệu chứng | Cách xử lý |
+|---|---|
+| `docker pull` báo `denied` dù package public | Pi còn lưu token GHCR cũ đã hết hạn → `docker logout ghcr.io` rồi pull lại |
+| `429 TooManyRequests` liên tục | tăng `MIN_DELAY_SECONDS`/`MAX_DELAY_SECONDS` (mục 7); kiểm tra `docker ps` không có 2 container cùng chạy, và không máy nào khác dùng chung API key |
+| `Out of host capacity` mãi | bình thường — cứ để chạy; lâu quá thì giảm `OCPUS`/`MEMORY_GB` |
+| `--check` FAIL ở `OCI key_file` | `key_file` trong `oci_config` phải là `/data/oci_api_key.pem` |
+| `--check` FAIL ở SSH key | `SSH_PUBLIC_KEY_PATH=/data/id_ed25519.pub`, file phải là `.pub` |
+| `NotAuthorizedOrNotFound` | sai OCID, hoặc subnet/image khác region với `oci_config` |
+
+---
+
+## 11. Chạy trực tiếp (không Docker)
 
 ```bash
 python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 
-# nhớ sửa lại SSH_PUBLIC_KEY_PATH / OCI_CONFIG_FILE / LOG_FILE về path trên host
+# sửa SSH_PUBLIC_KEY_PATH / OCI_CONFIG_FILE / LOG_FILE và key_file về path trên host
 python -m a1launcher --check
 python -m a1launcher
 ```
@@ -279,44 +437,7 @@ python tests/smoke_test.py
 
 ---
 
-## 8. Tuỳ chọn
-
-### `--dry-run`
-
-In ra payload `LaunchInstanceDetails` cho từng AD rồi thoát, **không gọi `LaunchInstance`**:
-
-```bash
-docker run --rm ... a1launcher:latest --dry-run
-```
-
-### Thông báo Telegram
-
-Bật trong `.env`:
-
-```ini
-TELEGRAM_ENABLED=true
-TELEGRAM_BOT_TOKEN=123456:AA...
-TELEGRAM_CHAT_ID=987654321
-```
-
-Khi tạo thành công, tool gửi tin nhắn kèm OCID, public IP, số lần thử và tổng thời gian.
-Gửi lỗi chỉ ghi log, không làm hỏng kết quả launch.
-
-### Các flag khác
-
-| Flag | Ý nghĩa |
-|---|---|
-| `--check` | chỉ preflight rồi thoát |
-| `--dry-run` | in payload, không launch |
-| `--no-api-check` | preflight không gọi API |
-| `--skip-preflight` | launch thẳng, bỏ preflight |
-| `--env-file` / `--config` | đổi đường dẫn `.env` / `config.yaml` |
-| `--profile` | ghi đè `OCI_PROFILE` |
-| `--log-file` / `--log-level` | ghi đè cấu hình log |
-
----
-
-## 9. Cách tool xử lý lỗi
+## 12. Cách tool xử lý lỗi
 
 Phân loại dựa trên **`status` và `code`** có cấu trúc của `oci.exceptions.ServiceError`,
 không dò chuỗi text:
@@ -325,7 +446,7 @@ không dò chuỗi text:
 |---|---|
 | `OutOfCapacity` / `OutOfHostCapacity` | log 1 dòng, thử AD kế tiếp |
 | `LimitExceeded` / `QuotaExceeded` | **dừng hẳn, exit `1`** — đã hết quota A1 |
-| HTTP 429 / `TooManyRequests` | nghỉ thêm `RATE_LIMIT_SLEEP_SECONDS` (mặc định 15 phút) |
+| HTTP 429 / `TooManyRequests` | nghỉ thêm `RATE_LIMIT_SLEEP_SECONDS` (mặc định code 15 phút, `.env.example` 10 phút) |
 | 401/403, `NotAuthorizedOrNotFound` | cảnh báo to (thường là sai OCID/policy), vẫn thử tiếp |
 | còn lại | log full traceback, thử tiếp |
 
@@ -347,7 +468,7 @@ in số lần đã thử rồi thoát gọn.
 
 ---
 
-## 10. Ghi chú về hạn mức Always Free
+## 13. Ghi chú về hạn mức Always Free
 
 - Tổng cho **tất cả** instance A1: **4 OCPU + 24 GB RAM**.
 - Cấu hình mặc định `2 OCPU / 12 GB` nằm gọn trong free tier và **vẫn dư 2 OCPU + 12 GB**
@@ -355,3 +476,6 @@ in số lần đã thử rồi thoát gọn.
 - Tỉ lệ A1.Flex: tối đa **6 GB RAM mỗi OCPU**.
 - Block storage Always Free tổng cộng 200 GB; boot volume 50 GB là an toàn. Đặt trên
   200 GB sẽ bị `--check` cảnh báo WARN vì có thể phát sinh phí.
+- Chỉ free ở **home region** (Console → avatar → **Tenancy** → *Home region*).
+- Tài khoản **Free Tier** không thể bị trừ tiền — vượt hạn mức thì Oracle chặn. Tài khoản
+  **Pay As You Go** vượt hạn mức sẽ bị tính tiền → nên đặt *Billing → Budgets* cảnh báo 1 USD.

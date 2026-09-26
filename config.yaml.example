@@ -5,7 +5,7 @@
 compartment_id: "ocid1.tenancy.oc1..aaaaaaaaexamplexxxxxx"
 subnet_id: "ocid1.subnet.oc1.ap-singapore-1.aaaaaaaaexamplexxxxxx"
 image_id: "ocid1.image.oc1.ap-singapore-1.aaaaaaaaexamplexxxxxx"   # must be aarch64
-ssh_public_key_path: "/keys/id_ed25519.pub"                        # path inside the container
+ssh_public_key_path: "/data/id_ed25519.pub"                        # path inside the container
 display_name: "a1-flex"
 
 # --- Shape (Always Free A1 budget: 4 OCPU / 24 GB total) --------------------
@@ -21,14 +21,14 @@ availability_domains: []
 nsg_ids: []
 
 # --- OCI credentials --------------------------------------------------------
-oci_config_file: "/home/app/.oci/config"   # path inside the container
+oci_config_file: "/data/oci_config"        # path inside the container
 oci_profile: "DEFAULT"
 
 # --- Retry behaviour --------------------------------------------------------
-min_delay_seconds: 60
-max_delay_seconds: 180
+min_delay_seconds: 240
+max_delay_seconds: 360
 ad_delay_seconds: 10
-rate_limit_sleep_seconds: 900
+rate_limit_sleep_seconds: 600
 max_rounds: 0          # 0 = forever
 
 # --- Logging ----------------------------------------------------------------
